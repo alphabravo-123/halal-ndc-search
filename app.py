@@ -1,158 +1,149 @@
-import sqlite3
+
 import streamlit as st
-import pandas as pd
-import datetime
+import requests, sqlite3, pandas as pd
+import xml.etree.ElementTree as ET
+from urllib.parse import urlencode
+from datetime import datetime
 
-DB_PATH = "halal_ndc.db"
+DAILYMED_BASE = "https://dailymed.nlm.nih.gov/dailymed/services/v2"
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+st.set_page_config(page_title="DailyMed Ingredients + Halal", page_icon="💊", layout="wide")
+st.title("💊 DailyMed Ingredients + Halal")
 
+# --- DB ---
+DB = "halal_tags.db"
 def init_db():
-    conn = get_conn()
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ndc TEXT NOT NULL UNIQUE,
-        proprietary_name TEXT,
-        nonproprietary_name TEXT,
-        labeler_name TEXT,
-        dosage_form TEXT,
-        route TEXT,
-        marketing_status TEXT,
-        package_description TEXT,
-        last_updated TEXT
-    );
-    CREATE TABLE IF NOT EXISTS halal_info (
-        product_id INTEGER NOT NULL UNIQUE,
-        halal_status TEXT DEFAULT 'Unknown',
-        ethanol_pct REAL,
-        gelatin_source TEXT,
-        glycerin_source TEXT,
-        stearate_source TEXT,
-        shellac INTEGER DEFAULT 0,
-        notes TEXT,
-        evidence_url TEXT,
-        reviewed_by TEXT,
-        reviewed_on TEXT,
-        FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
-    );
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tags (
+            setid TEXT PRIMARY KEY,
+            status TEXT CHECK(status IN ('Halal','Non-Halal','Unknown')) DEFAULT 'Unknown',
+            notes TEXT,
+            updated_at TEXT
+        )
     """)
-    conn.commit()
+    conn.commit(); conn.close()
 
-def upsert_product(prod):
-    conn = get_conn()
+def get_tag(setid):
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO products (ndc, proprietary_name, nonproprietary_name, labeler_name,
-            dosage_form, route, marketing_status, package_description, last_updated)
-        VALUES (:ndc, :proprietary_name, :nonproprietary_name, :labeler_name, :dosage_form,
-            :route, :marketing_status, :package_description, :last_updated)
-        ON CONFLICT(ndc) DO UPDATE SET
-            proprietary_name=excluded.proprietary_name,
-            nonproprietary_name=excluded.nonproprietary_name,
-            labeler_name=excluded.labeler_name,
-            dosage_form=excluded.dosage_form,
-            route=excluded.route,
-            marketing_status=excluded.marketing_status,
-            package_description=excluded.package_description,
-            last_updated=excluded.last_updated
-    """, prod)
-    conn.commit()
-    cur.execute("SELECT id FROM products WHERE ndc=?", (prod["ndc"],))
-    return cur.fetchone()["id"]
+    cur.execute("SELECT status,notes FROM tags WHERE setid=?", (setid,))
+    row = cur.fetchone(); conn.close()
+    return row if row else ("Unknown", "")
 
-def upsert_halal(product_id, halal):
-    conn = get_conn()
+def set_tag(setid,status,notes=""):
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    halal["product_id"] = product_id
-    cur.execute("""
-        INSERT INTO halal_info (product_id, halal_status, ethanol_pct, gelatin_source,
-            glycerin_source, stearate_source, shellac, notes, evidence_url,
-            reviewed_by, reviewed_on)
-        VALUES (:product_id, :halal_status, :ethanol_pct, :gelatin_source,
-            :glycerin_source, :stearate_source, :shellac, :notes, :evidence_url,
-            :reviewed_by, :reviewed_on)
-        ON CONFLICT(product_id) DO UPDATE SET
-            halal_status=excluded.halal_status,
-            ethanol_pct=excluded.ethanol_pct,
-            gelatin_source=excluded.gelatin_source,
-            glycerin_source=excluded.glycerin_source,
-            stearate_source=excluded.stearate_source,
-            shellac=excluded.shellac,
-            notes=excluded.notes,
-            evidence_url=excluded.evidence_url,
-            reviewed_by=excluded.reviewed_by,
-            reviewed_on=excluded.reviewed_on
-    """, halal)
-    conn.commit()
+    cur.execute("INSERT OR REPLACE INTO tags (setid,status,notes,updated_at) VALUES (?,?,?,?)",
+                (setid,status,notes,datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
 
-def search(query: str) -> pd.DataFrame:
-    sql = """
-        SELECT p.ndc, p.proprietary_name, p.nonproprietary_name, p.labeler_name,
-               p.dosage_form, p.route, p.marketing_status,
-               h.halal_status, h.ethanol_pct, h.gelatin_source, h.notes
-        FROM products p
-        LEFT JOIN halal_info h ON p.id = h.product_id
-        WHERE p.ndc LIKE :q OR p.proprietary_name LIKE :q OR p.nonproprietary_name LIKE :q
-        ORDER BY p.proprietary_name LIMIT 500
-    """
-    return pd.read_sql_query(sql, get_conn(), params={"q": f"%{query}%"})
+# --- DailyMed API ---
+def search_spls_by_name(name, page=1, pagesize=25):
+    params = {"drug_name": name, "name_type": "both", "pagesize": pagesize, "page": page}
+    url = f"{DAILYMED_BASE}/spls.json?{urlencode(params)}"
+    r = requests.get(url,timeout=30); r.raise_for_status()
+    return r.json()
 
-st.set_page_config(page_title="NDC Halal Search", page_icon="🕌", layout="wide")
-st.title("🕌 NDC Halal Search")
+def search_spl_by_ndc(ndc):
+    url = f"{DAILYMED_BASE}/ndcs/{ndc}.json"
+    r = requests.get(url,timeout=30)
+    if r.status_code!=200: return None
+    return r.json()
 
+def fetch_spl_xml(setid):
+    url = f"{DAILYMED_BASE}/spls/{setid}.xml"
+    r = requests.get(url,timeout=60); r.raise_for_status()
+    return ET.fromstring(r.content)
+
+def _ns(tag): return f"{{urn:hl7-org:v3}}{tag}"
+
+def _iter_sections(root):
+    for comp in root.findall(f".//{_ns('component')}"):
+        sec = comp.find(f".//{_ns('section')}")
+        if sec is None: continue
+        code = sec.find(f"{_ns('code')}")
+        title_el = sec.find(f"{_ns('title')}")
+        display = code.get("displayName") if code is not None else (title_el.text if title_el is not None else "")
+        yield display.strip().upper() if display else "" , sec
+
+def _extract_items(sec):
+    items=[]
+    for li in sec.findall(f".//{_ns('list')}/{_ns('item')}"):
+        texts=[p.text.strip() for p in li.findall(f".//{_ns('paragraph')}") if p.text]
+        if texts: items.append(" ".join(texts))
+    if not items:
+        for p in sec.findall(f".//{_ns('paragraph')}"):
+            if p.text and p.text.strip(): items.append(p.text.strip())
+    seen=set(); cleaned=[]
+    for t in items:
+        t2=" ".join(t.split())
+        if t2 and t2 not in seen:
+            seen.add(t2); cleaned.append(t2)
+    return cleaned
+
+def get_ingredients(setid):
+    root = fetch_spl_xml(setid)
+    active,inactive=[],[]
+    for title,sec in _iter_sections(root):
+        t=title.replace("INGREDIENTS","INGREDIENT").strip()
+        if t=="ACTIVE INGREDIENT": active=_extract_items(sec)
+        elif t=="INACTIVE INGREDIENT": inactive=_extract_items(sec)
+    return active,inactive
+
+# --- UI ---
 init_db()
+with st.sidebar:
+    st.header("Search")
+    mode = st.radio("Search by", ["Drug Name","NDC"])
+    q = st.text_input("Enter query")
+    pagesize = st.selectbox("Results per page", [10,25,50], index=1)
+    if "page" not in st.session_state: st.session_state.page=1
+    if st.button("Search",type="primary"): st.session_state.page=1
 
-with st.expander("📥 Upload CSV Data"):
-    st.caption("Upload CSV with columns: ndc, proprietary_name, nonproprietary_name, labeler_name, dosage_form, route, marketing_status, package_description, halal_status, ethanol_pct, gelatin_source, notes, reviewed_by")
-    uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
-    if uploaded:
-        df = pd.read_csv(uploaded)
-        st.dataframe(df.head(), use_container_width=True)
-        if st.button("Import to Database"):
-            count = 0
-            for _, row in df.iterrows():
-                if not str(row.get("ndc", "")).strip():
-                    continue
-                prod = dict(
-                    ndc=str(row["ndc"]),
-                    proprietary_name=row.get("proprietary_name"),
-                    nonproprietary_name=row.get("nonproprietary_name"),
-                    labeler_name=row.get("labeler_name"),
-                    dosage_form=row.get("dosage_form"),
-                    route=row.get("route"),
-                    marketing_status=row.get("marketing_status"),
-                    package_description=row.get("package_description"),
-                    last_updated=datetime.datetime.utcnow().isoformat()
-                )
-                pid = upsert_product(prod)
-                halal = dict(
-                    halal_status=row.get("halal_status", "Unknown"),
-                    ethanol_pct=float(row["ethanol_pct"]) if not pd.isna(row.get("ethanol_pct")) else None,
-                    gelatin_source=row.get("gelatin_source"),
-                    glycerin_source=row.get("glycerin_source"),
-                    stearate_source=row.get("stearate_source"),
-                    shellac=int(row.get("shellac", 0)) if not pd.isna(row.get("shellac", 0)) else 0,
-                    notes=row.get("notes"),
-                    evidence_url=row.get("evidence_url"),
-                    reviewed_by=row.get("reviewed_by"),
-                    reviewed_on=datetime.datetime.utcnow().date().isoformat()
-                )
-                upsert_halal(pid, halal)
-                count += 1
-            st.success(f"Imported {count} rows ✅")
-
-query = st.text_input("🔎 Search NDC, Brand, or Generic:")
-if query:
-    results = search(query)
-    st.write(f"Found {len(results)} result(s)")
-    st.dataframe(results, use_container_width=True)
-    st.download_button("⬇️ Download CSV", results.to_csv(index=False).encode("utf-8"), "results.csv", "text/csv")
+results=[]
+if q:
+    try:
+        if mode=="Drug Name":
+            data=search_spls_by_name(q, page=st.session_state.page, pagesize=pagesize)
+            results=data.get("data",[])
+        else:
+            data=search_spl_by_ndc(q)
+            if data: results=data.get("data",[])
+        if results:
+            df=pd.DataFrame([{"Title":r.get("title"),"SetID":r.get("setid")} for r in results])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            idx=st.selectbox("Pick a label", list(range(len(results))), format_func=lambda i: results[i].get("title",""))
+            setid=results[idx]["setid"]
+            active,inactive=get_ingredients(setid)
+            status,notes=get_tag(setid)
+            st.subheader("Ingredients")
+            col1,col2=st.columns(2)
+            with col1:
+                st.markdown("**Active**")
+                for a in active: st.write("- "+a)
+            with col2:
+                st.markdown("**Inactive**")
+                for i in inactive: st.write("- "+i)
+            st.markdown(f"**Halal status:** {status}")
+            # CSV Export
+            df_out=pd.DataFrame([{"Title":results[idx].get("title"),
+                                  "SetID":setid,
+                                  "Active":"; ".join(active),
+                                  "Inactive":"; ".join(inactive),
+                                  "Halal Status":status}])
+            st.download_button("Download CSV", df_out.to_csv(index=False).encode("utf-8"), "result.csv","text/csv")
+            # Admin
+            with st.expander("Admin panel"):
+                pw=st.text_input("Password", type="password")
+                if pw and "admin_password" in st.secrets and pw==st.secrets["admin_password"]:
+                    new_status=st.selectbox("Set halal status",["Halal","Non-Halal","Unknown"], index=["Halal","Non-Halal","Unknown"].index(status if status in ["Halal","Non-Halal"] else "Unknown"))
+                    new_notes=st.text_area("Notes",notes)
+                    if st.button("Update"):
+                        set_tag(setid,new_status,new_notes)
+                        st.success("Updated")
+    except Exception as e:
+        st.error(str(e))
 else:
-    st.info("Enter a search term to begin.")
-
-st.markdown("---\n⚠️ **Disclaimer:** Informational only. Not medical or religious advice.")
+    st.info("Enter a query in the sidebar.")
