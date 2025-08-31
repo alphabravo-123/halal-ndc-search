@@ -1,3 +1,1 @@
-# NDC Halal Search
-
-Deployed on Streamlit Cloud.
+# NDC Halal Search with CSV Upload
